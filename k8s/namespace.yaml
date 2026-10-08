@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: resolveit
+  labels:
+    name: resolveit
+    app: complaint-management

@@ -1,0 +1,12 @@
+apiVersion: v2
+name: resolveit
+description: Helm chart for ResolveIT – Complaint Management System & DevOps Project
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - complaint-system
+  - devops
+  - express
+  - react
+  - mongodb

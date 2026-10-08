@@ -1,0 +1,36 @@
+replicaCount: 2
+
+image:
+  backendRepository: resolveituser/resolveit-backend
+  frontendRepository: resolveituser/resolveit-frontend
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  backendPort: 5000
+  frontendPort: 80
+
+ingress:
+  enabled: true
+  host: resolveit.local
+
+resources:
+  backend:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  frontend:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+env:
+  nodeEnv: production
+  mongodbUri: "mongodb://mongodb-service:27017/resolveit"
