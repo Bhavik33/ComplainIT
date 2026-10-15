@@ -8,6 +8,7 @@ const { createAuditLog } = require('../services/auditService');
 const { sendNotification } = require('../services/notificationService');
 const { sendSuccess, sendError } = require('../utils/response');
 const { complaintsCreatedTotal, complaintsResolvedTotal } = require('../config/metrics');
+const { computeComplaintSimilarity, SIMILARITY_THRESHOLD } = require('../services/duplicateService');
 
 // Valid status transitions map
 const VALID_TRANSITIONS = {
@@ -94,6 +95,33 @@ const createComplaint = async (req, res, next) => {
       .populate('category', 'name icon')
       .populate('createdBy', 'name email department')
       .populate('attachments');
+
+    // Auto background duplicate scan (non-blocking)
+    setImmediate(async () => {
+      try {
+        const candidates = await Complaint.find({
+          _id: { $ne: complaint._id },
+          category: categoryId,
+          status: { $nin: ['CLOSED', 'REJECTED'] }
+        }).populate('category', 'name').lean();
+
+        const similar = [];
+        for (const candidate of candidates) {
+          const score = computeComplaintSimilarity(populatedComplaint.toObject(), candidate);
+          if (score >= SIMILARITY_THRESHOLD) {
+            similar.push({ complaint: candidate._id, similarityScore: score });
+          }
+        }
+
+        if (similar.length > 0) {
+          await Complaint.findByIdAndUpdate(complaint._id, {
+            similarComplaints: similar.slice(0, 10)
+          });
+        }
+      } catch (err) {
+        // Non-critical background task — swallow error silently
+      }
+    });
 
     return sendSuccess(res, 201, 'Complaint submitted successfully', populatedComplaint);
   } catch (error) {
@@ -388,11 +416,11 @@ const addInternalNote = async (req, res, next) => {
   }
 };
 
-// @desc Rate resolved complaint (User)
+// @desc Rate resolved complaint with satisfaction score + optional reopen request (User)
 // @route POST /api/complaints/:id/rate
 const rateComplaint = async (req, res, next) => {
   try {
-    const { score, feedback } = req.body;
+    const { score, feedback, isResolutionSatisfactory, reopenRequested, reopenReason } = req.body;
     if (!score || score < 1 || score > 5) {
       return sendError(res, 400, 'Rating score must be between 1 and 5', 'VALIDATION_ERROR');
     }
@@ -410,32 +438,185 @@ const rateComplaint = async (req, res, next) => {
       return sendError(res, 400, 'Complaints must be RESOLVED or CLOSED before rating', 'INVALID_STATE');
     }
 
+    // Handle reopen request embedded in feedback
+    if (reopenRequested) {
+      if (!reopenReason || reopenReason.trim().length < 10) {
+        return sendError(res, 400, 'A detailed reopen reason (min 10 chars) is required', 'VALIDATION_ERROR');
+      }
+      complaint.reopenRequest = {
+        requested: true,
+        reason: reopenReason.trim(),
+        requestedAt: new Date(),
+        requestedBy: req.user._id,
+        reviewed: false
+      };
+      await sendNotification(
+        complaint.assignedStaff || complaint.createdBy,
+        'Reopen Request Submitted',
+        `User has submitted a reopen request for ${complaint.complaintId}. Reason: "${reopenReason.trim().substring(0, 60)}..."`,
+        complaint._id
+      );
+    }
+
     let ratingObj = await Rating.findOne({ complaint: complaint._id });
     if (ratingObj) {
       ratingObj.score = score;
       ratingObj.feedback = feedback || '';
+      ratingObj.isResolutionSatisfactory = isResolutionSatisfactory !== false;
+      ratingObj.reopenRequested = Boolean(reopenRequested);
+      ratingObj.reopenReason = reopenReason || '';
       await ratingObj.save();
     } else {
       ratingObj = await Rating.create({
         complaint: complaint._id,
         user: req.user._id,
         score,
-        feedback: feedback || ''
+        feedback: feedback || '',
+        isResolutionSatisfactory: isResolutionSatisfactory !== false,
+        reopenRequested: Boolean(reopenRequested),
+        reopenReason: reopenReason || ''
       });
       complaint.rating = ratingObj._id;
-      await complaint.save();
     }
+    await complaint.save();
 
     await createAuditLog(
       req.user._id,
       'COMPLAINT_RATED',
       'Complaint',
       complaint._id,
-      { score, feedback },
+      { score, feedback, isResolutionSatisfactory, reopenRequested },
       req.ip
     );
 
-    return sendSuccess(res, 200, 'Thank you for your rating!', ratingObj);
+    return sendSuccess(res, 200, 'Thank you for your feedback!', ratingObj);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc Request reopen of a resolved complaint (User) — standalone without rating
+// @route POST /api/complaints/:id/request-reopen
+const requestReopen = async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+
+    if (!reason || reason.trim().length < 10) {
+      return sendError(res, 400, 'Please provide a detailed reason (minimum 10 characters) for the reopen request', 'VALIDATION_ERROR');
+    }
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) {
+      return sendError(res, 404, 'Complaint not found', 'COMPLAINT_NOT_FOUND');
+    }
+
+    if (complaint.createdBy.toString() !== req.user._id.toString()) {
+      return sendError(res, 403, 'Only the complaint creator can request a reopen', 'FORBIDDEN');
+    }
+
+    if (!['RESOLVED', 'CLOSED'].includes(complaint.status)) {
+      return sendError(res, 400, 'Only RESOLVED or CLOSED complaints can be requested for reopening', 'INVALID_STATE');
+    }
+
+    if (complaint.reopenRequest && complaint.reopenRequest.requested && !complaint.reopenRequest.reviewed) {
+      return sendError(res, 400, 'A reopen request is already pending review by staff', 'PENDING_REQUEST');
+    }
+
+    complaint.reopenRequest = {
+      requested: true,
+      reason: reason.trim(),
+      requestedAt: new Date(),
+      requestedBy: req.user._id,
+      reviewed: false
+    };
+    await complaint.save();
+
+    await createAuditLog(
+      req.user._id,
+      'REOPEN_REQUESTED',
+      'Complaint',
+      complaint._id,
+      { complaintId: complaint.complaintId, reason: reason.trim() },
+      req.ip
+    );
+
+    // Notify assigned staff and admin
+    if (complaint.assignedStaff) {
+      await sendNotification(
+        complaint.assignedStaff,
+        'Reopen Request Received',
+        `Complaint ${complaint.complaintId} has a pending reopen request. User says: "${reason.trim().substring(0, 80)}"`,
+        complaint._id
+      );
+    }
+
+    return sendSuccess(res, 200, 'Reopen request submitted. Staff will review and get back to you.', {
+      complaintId: complaint.complaintId,
+      reopenRequest: complaint.reopenRequest
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc Admin/Staff reviews and approves or rejects a reopen request
+// @route PUT /api/complaints/:id/review-reopen
+const reviewReopenRequest = async (req, res, next) => {
+  try {
+    const { approved, note } = req.body;
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) {
+      return sendError(res, 404, 'Complaint not found', 'COMPLAINT_NOT_FOUND');
+    }
+
+    if (!complaint.reopenRequest || !complaint.reopenRequest.requested) {
+      return sendError(res, 400, 'No pending reopen request found for this complaint', 'NO_REOPEN_REQUEST');
+    }
+
+    // Mark as reviewed
+    complaint.reopenRequest.reviewed = true;
+
+    if (approved) {
+      complaint.status = 'REOPENED';
+      complaint.statusHistory.push({
+        status: 'REOPENED',
+        changedBy: req.user._id,
+        note: note || 'Reopen request approved by staff'
+      });
+
+      await sendNotification(
+        complaint.reopenRequest.requestedBy,
+        'Reopen Request Approved',
+        `Your reopen request for complaint ${complaint.complaintId} has been approved. The issue is under review again.`,
+        complaint._id
+      );
+    } else {
+      await sendNotification(
+        complaint.reopenRequest.requestedBy,
+        'Reopen Request Declined',
+        `Your reopen request for complaint ${complaint.complaintId} was reviewed but declined. ${note ? 'Staff note: ' + note : ''}`,
+        complaint._id
+      );
+    }
+
+    await complaint.save();
+
+    await createAuditLog(
+      req.user._id,
+      approved ? 'REOPEN_APPROVED' : 'REOPEN_REJECTED',
+      'Complaint',
+      complaint._id,
+      { complaintId: complaint.complaintId, approved, note },
+      req.ip
+    );
+
+    return sendSuccess(
+      res,
+      200,
+      approved ? 'Complaint reopened successfully' : 'Reopen request declined',
+      complaint
+    );
   } catch (error) {
     next(error);
   }
@@ -476,5 +657,7 @@ module.exports = {
   updatePriority,
   addInternalNote,
   rateComplaint,
+  requestReopen,
+  reviewReopenRequest,
   exportCsv
 };

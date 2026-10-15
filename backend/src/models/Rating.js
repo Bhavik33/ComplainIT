@@ -23,6 +23,18 @@ const ratingSchema = new mongoose.Schema(
     feedback: {
       type: String,
       default: ''
+    },
+    isResolutionSatisfactory: {
+      type: Boolean,
+      default: true
+    },
+    reopenRequested: {
+      type: Boolean,
+      default: false
+    },
+    reopenReason: {
+      type: String,
+      default: ''
     }
   },
   {

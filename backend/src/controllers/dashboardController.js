@@ -1,6 +1,7 @@
 const Complaint = require('../models/Complaint');
 const User = require('../models/User');
 const Category = require('../models/Category');
+const Rating = require('../models/Rating');
 const { sendSuccess } = require('../utils/response');
 
 // @desc Get dashboard metrics and charts data
@@ -111,6 +112,31 @@ const getDashboardStats = async (req, res, next) => {
       avgResolutionHours = Math.round((totalHours / resolvedList.length) * 10) / 10;
     }
 
+    // 7. Satisfaction Score Analytics
+    const allRatings = await Rating.find({}).select('score isResolutionSatisfactory reopenRequested');
+    const avgSatisfactionScore = allRatings.length > 0
+      ? Math.round((allRatings.reduce((sum, r) => sum + r.score, 0) / allRatings.length) * 10) / 10
+      : 0;
+    const satisfiedCount = allRatings.filter(r => r.isResolutionSatisfactory !== false).length;
+    const dissatisfiedCount = allRatings.filter(r => r.isResolutionSatisfactory === false).length;
+    const satisfactionRate = allRatings.length > 0
+      ? Math.round((satisfiedCount / allRatings.length) * 100)
+      : 0;
+    const ratingDistribution = [1, 2, 3, 4, 5].map(star => ({
+      star,
+      count: allRatings.filter(r => r.score === star).length
+    }));
+
+    // 8. Reopen Requests (pending review)
+    const pendingReopenRequests = await Complaint.countDocuments({
+      'reopenRequest.requested': true,
+      'reopenRequest.reviewed': false
+    });
+
+    // 9. Duplicate / Master Incident stats
+    const masterIncidentCount = await Complaint.countDocuments({ isMasterIncident: true });
+    const linkedDuplicateCount = await Complaint.countDocuments({ masterComplaint: { $ne: null } });
+
     return sendSuccess(res, 200, 'Admin analytics dashboard stats', {
       total: totalComplaints,
       new: newComplaints,
@@ -124,7 +150,19 @@ const getDashboardStats = async (req, res, next) => {
       complaintsByPriority,
       complaintsByStatus,
       complaintsOverTime,
-      staffWorkload
+      staffWorkload,
+      // Satisfaction & Feedback
+      avgSatisfactionScore,
+      satisfactionRate,
+      satisfiedCount,
+      dissatisfiedCount,
+      ratingDistribution,
+      totalRatings: allRatings.length,
+      // Reopen monitoring
+      pendingReopenRequests,
+      // Duplicates
+      masterIncidentCount,
+      linkedDuplicateCount
     });
   } catch (error) {
     next(error);

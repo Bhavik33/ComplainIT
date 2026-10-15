@@ -123,6 +123,40 @@ const complaintSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Rating',
       default: null
+    },
+
+    // ── Duplicate Detection Fields ──────────────────────────────
+    // Complaints flagged as similar to this one
+    similarComplaints: [
+      {
+        complaint: { type: mongoose.Schema.Types.ObjectId, ref: 'Complaint' },
+        similarityScore: { type: Number, default: 0 }
+      }
+    ],
+    // If this complaint is merged under a master incident
+    masterComplaint: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Complaint',
+      default: null,
+      index: true
+    },
+    // If this is the master incident that others are linked to
+    isMasterIncident: {
+      type: Boolean,
+      default: false
+    },
+    linkedCount: {
+      type: Number,
+      default: 0
+    },
+
+    // ── Reopen Request Fields ───────────────────────────────────
+    reopenRequest: {
+      requested: { type: Boolean, default: false },
+      reason: { type: String, default: '' },
+      requestedAt: { type: Date, default: null },
+      requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      reviewed: { type: Boolean, default: false }
     }
   },
   {
